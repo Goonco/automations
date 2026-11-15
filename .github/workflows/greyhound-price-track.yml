@@ -1,5 +1,5 @@
 # Display name shown in the GitHub Actions tab.
-name: Greyhound price tracker
+name: greyhound-price-tracker
 
 on:
   # Allow manual runs from the GitHub Actions tab.
@@ -147,7 +147,7 @@ jobs:
           : "${TELEGRAM_CHAT_ID:?Missing TELEGRAM_CHAT_ID}"
 
           if [ "$WORKFLOW_FAILED" = "true" ]; then
-            printf -v message 'Greyhound price tracking failed.\nLogs: %s' \
+            printf -v message '[ERROR] Price tracking failed 😱\n[LOG]: %s' \
               "$RUN_URL"
           else
             # Read integer cents and format the minimum price in dollars.
@@ -163,7 +163,7 @@ jobs:
           PY
             )
 
-            printf -v message 'New lowest price: $%s per person.\nLogs: %s' \
+            printf -v message '[NEW LOWEST PRICE] $%s 🤩\n[LOG]: %s' \
               "$price" "$RUN_URL"
           fi
 

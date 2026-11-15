@@ -1,0 +1,183 @@
+# Display name shown in the GitHub Actions tab.
+name: Greyhound price tracker
+
+on:
+  # Run every hour at minute 17.
+  # Cron fields: minute, hour, day of month, month, day of week.
+  # GitHub uses UTC by default, and scheduled runs may be delayed.
+  schedule:
+    - cron: "17 * * * *"
+
+  # Allow manual runs from the GitHub Actions tab.
+  workflow_dispatch:
+
+permissions:
+  # Allow the built-in GITHUB_TOKEN to commit and push CSV files.
+  contents: write
+
+concurrency:
+  # Prevent runs in this group from executing at the same time.
+  group: greyhound-price-track
+
+  # Let the active run finish instead of canceling it for a new run.
+  cancel-in-progress: false
+
+jobs:
+  # Internal identifier for this job.
+  track:
+    # Use a GitHub-hosted Ubuntu runner.
+    runs-on: ubuntu-latest
+
+    # Stop the job if it takes longer than 15 minutes.
+    timeout-minutes: 15
+
+    # Run shell commands from the tracker directory inside this repository.
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/greyhound-price-track
+
+    env:
+      # Store the default branch name, such as main or master.
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: Checkout repository
+        # Download the repository into the runner's workspace.
+        # Authentication for git push is configured automatically.
+        uses: actions/checkout@v7
+        with:
+          # Always use the default branch, including for manual runs.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        # Install Python and make it available to later steps.
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          # Install the Python packages required by main.py and record.py.
+          # Keep Pydantic within major version 2.
+          python -m pip install playwright "pydantic>=2,<3" typing_extensions
+
+          # Install Chromium and its required operating system packages.
+          python -m playwright install --with-deps chromium
+
+      - name: Run price tracker
+        # Allow later steps to reference this step's execution outcome.
+        id: tracker
+        run: |
+          # Collect prices and update the CSV files.
+          python main.py
+
+          # main.py currently exits successfully even when it records ERROR.
+          # Check the latest record and explicitly fail this step if needed.
+          python - <<'PY'
+          import csv
+
+          with open("records.csv", newline="", encoding="utf-8") as f:
+              records = list(csv.DictReader(f))
+
+          if not records or records[-1].get("status") != "OK":
+              raise SystemExit(
+                  "Price collection failed. Check records.csv."
+              )
+          PY
+
+      - name: Save CSV files
+        # Expose outputs for future steps, such as Telegram notifications.
+        id: persist
+
+        # Save available records after either tracker success or failure.
+        # Skip this step if the workflow was canceled or the tracker was skipped.
+        if: ${{ !cancelled() && (steps.tracker.outcome == 'success' || steps.tracker.outcome == 'failure') }}
+
+        run: |
+          # Set the author identity for automated commits.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage only the CSV files that exist.
+          # min.csv might not exist if no successful price was collected yet.
+          for path in records.csv min.csv; do
+            if [ -f "$path" ]; then
+              git add -- "$path"
+            fi
+          done
+
+          # Check whether min.csv was created or changed.
+          # Publish the result before committing clears the staged changes.
+          # Later steps can read steps.persist.outputs.min_updated.
+          if git diff --cached --quiet -- min.csv; then
+            echo "min_updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "min_updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Avoid creating an empty commit when nothing changed.
+          if git diff --cached --quiet; then
+            echo "No CSV changes to save."
+            exit 0
+          fi
+
+          # Commit the staged CSV files.
+          git commit -m "chore: update price records"
+
+          # Push the commit to the default branch.
+          # Future runs will check out these saved records.
+          git push origin "HEAD:${DEFAULT_BRANCH}"
+
+      - name: Send Telegram notification
+        # Notify on failure or a minimum price update; skip canceled workflows.
+        if: ${{ !cancelled() && (failure() || steps.persist.outputs.min_updated == 'true') }}
+
+        # Use the workspace root so error notifications can run even if checkout fails.
+        working-directory: ${{ github.workspace }}
+
+        env:
+          # Read credentials from repository secrets.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Capture the failure status before this step starts.
+          WORKFLOW_FAILED: ${{ failure() }}
+
+          # Link the notification to this workflow run.
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        run: |
+          # Require both secrets before making a request.
+          : "${TELEGRAM_BOT_TOKEN:?Missing TELEGRAM_BOT_TOKEN}"
+          : "${TELEGRAM_CHAT_ID:?Missing TELEGRAM_CHAT_ID}"
+
+          if [ "$WORKFLOW_FAILED" = "true" ]; then
+            printf -v message 'Greyhound price tracking failed.\nLogs: %s' \
+              "$RUN_URL"
+          else
+            # Read integer cents and format the minimum price in dollars.
+            price=$(python3 - <<'PY'
+          import csv
+          import json
+
+          with open("src/greyhound-price-track/min.csv", newline="", encoding="utf-8") as f:
+              record = next(csv.DictReader(f))
+
+          cents = json.loads(record["prices"])[0]
+          print(f"{cents // 100}.{cents % 100:02d}")
+          PY
+            )
+
+            printf -v message 'New lowest price: $%s per person.\nLogs: %s' \
+              "$price" "$RUN_URL"
+          fi
+
+          # URL-encode the message and fail this step on HTTP errors.
+          # Discard the response body to keep personal chat details out of logs.
+          curl --fail --silent --show-error --max-time 30 \
+            --output /dev/null \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${message}"

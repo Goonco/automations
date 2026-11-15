@@ -6,7 +6,7 @@ on:
   # Cron fields: minute, hour, day of month, month, day of week.
   # GitHub uses UTC by default, and scheduled runs may be delayed.
   schedule:
-    - cron: "17 * * * *"
+    - cron: "23 * * * *"
 
   # Allow manual runs from the GitHub Actions tab.
   workflow_dispatch:
@@ -142,7 +142,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
           # Capture the failure status before this step starts.
-          WORKFLOW_FAILED: ${{ failure() }}
+          WORKFLOW_FAILED: ${{ job.status == 'failure' }}
 
           # Link the notification to this workflow run.
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
